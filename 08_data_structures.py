@@ -12,6 +12,7 @@ Run: python 08_data_structures.py
 """
 
 import heapq
+import threading
 import time
 from collections import deque
 from typing import Any, Generic, Hashable, List, Optional, Tuple, TypeVar
@@ -60,7 +61,7 @@ class RingBuffer(Generic[V]):
 
 
 # ---------------------------------------------------------------------------
-# 2. LRU Cache - Least Recently Used cache using dict + deque
+# 2. LRU Cache - Least Recently Used cache using dict + RLock
 # ---------------------------------------------------------------------------
 
 class LRUCache(Generic[K, V]):
@@ -70,28 +71,57 @@ class LRUCache(Generic[K, V]):
 
     Implementation: Python dicts preserve insertion order (3.7+), so we can
     move a key to the end by deleting and re-inserting it.
+
+    EXPAND #2: Thread-safe via threading.RLock (re-entrant lock).
+    RLock is used instead of plain Lock because get() calls pop() + re-insert,
+    and put() also calls pop() — if either method were to call the other
+    internally (e.g., a subclass override), a plain Lock would deadlock because
+    the same thread would try to acquire a lock it already holds.  An RLock
+    can be acquired multiple times by the *same* thread without blocking.
+
+    EXPAND #3: `ttl` (time-to-live) in seconds.  Entries older than ttl are
+    treated as missing even if still present in the cache.  Expiry is checked
+    lazily on access (no background sweeper thread needed for SRE scripts).
     """
 
-    def __init__(self, capacity: int) -> None:
+    def __init__(self, capacity: int, ttl: Optional[float] = None) -> None:
         self.capacity = capacity
-        self._cache: dict = {}   # key → value, ordered by access time
+        self.ttl = ttl                          # seconds; None = no expiry
+        self._cache: dict = {}                   # key -> value
+        self._timestamps: dict = {}              # key -> insertion time (for TTL)
+        self._lock = threading.RLock()           # EXPAND #2: re-entrant lock
+
+    def _expired(self, key: K) -> bool:
+        """Return True if the TTL has passed for this key."""
+        if self.ttl is None:
+            return False
+        return time.monotonic() - self._timestamps.get(key, 0) > self.ttl
 
     def get(self, key: K) -> Optional[V]:
-        if key not in self._cache:
-            return None
-        # Move to end = mark as most recently used
-        value = self._cache.pop(key)
-        self._cache[key] = value
-        return value
+        with self._lock:                         # acquire RLock; released at end of block
+            if key not in self._cache:
+                return None
+            if self._expired(key):               # EXPAND #3: treat expired entries as missing
+                del self._cache[key]
+                del self._timestamps[key]
+                return None
+            # Move to end = mark as most recently used
+            value = self._cache.pop(key)
+            self._cache[key] = value
+            self._timestamps[key] = time.monotonic()  # refresh timestamp on access
+            return value
 
     def put(self, key: K, value: V) -> None:
-        if key in self._cache:
-            self._cache.pop(key)
-        elif len(self._cache) >= self.capacity:
-            # Remove the oldest (first inserted) key - dict preserves insertion order
-            oldest = next(iter(self._cache))
-            del self._cache[oldest]
-        self._cache[key] = value
+        with self._lock:
+            if key in self._cache:
+                self._cache.pop(key)
+            elif len(self._cache) >= self.capacity:
+                # Remove the oldest (first inserted) key - dict preserves insertion order
+                oldest = next(iter(self._cache))
+                del self._cache[oldest]
+                del self._timestamps[oldest]
+            self._cache[key] = value
+            self._timestamps[key] = time.monotonic()  # record insertion time for TTL
 
     def __len__(self) -> int:
         return len(self._cache)
@@ -164,13 +194,15 @@ class SlidingWindowRateLimiter:
         self.window_s = window_s
         self._calls: deque = deque()
 
-    def allow(self) -> bool:
-        now = time.monotonic()
+    def _prune(self, now: float) -> None:
+        """Remove timestamps that have fallen outside the sliding window."""
         cutoff = now - self.window_s
-
-        # Remove timestamps outside the window (left side of deque = oldest)
         while self._calls and self._calls[0] < cutoff:
             self._calls.popleft()
+
+    def allow(self) -> bool:
+        now = time.monotonic()
+        self._prune(now)                    # drop stale entries before checking
 
         if len(self._calls) < self.max_calls:
             self._calls.append(now)
@@ -179,8 +211,67 @@ class SlidingWindowRateLimiter:
 
     @property
     def current_usage(self) -> int:
+        # BUG FIX #1: prune first so stale entries are not counted.
+        # Previously this re-scanned without pruning, potentially returning a
+        # count > 0 after the window had fully expired.
         now = time.monotonic()
-        return sum(1 for t in self._calls if t >= now - self.window_s)
+        self._prune(now)
+        return len(self._calls)
+
+
+# ---------------------------------------------------------------------------
+# EXPAND #4: Token Bucket Rate Limiter
+# ---------------------------------------------------------------------------
+
+class TokenBucket:
+    """
+    Alternative rate limiter using the token-bucket algorithm.
+    Tokens refill at `rate` per second up to `capacity` (burst budget).
+    allow() consumes one token; returns False if the bucket is empty.
+
+    COMPARISON vs SlidingWindowRateLimiter under bursty traffic:
+    - SlidingWindow: strictly limits the number of calls in the last W seconds.
+      A burst of max_calls is allowed but once they are recorded, the window
+      must slide past all of them before new calls are permitted.  Fairest for
+      sustained traffic.
+    - TokenBucket: refills tokens at a steady rate regardless of when requests
+      arrive.  If traffic is quiet for a while, unused tokens accumulate up to
+      `capacity`, allowing a burst of up to `capacity` calls all at once.
+      More permissive under bursty workloads (allows "credit" to build up).
+
+    Example: max_calls=5, window=1s vs rate=5/s, capacity=10.
+    After 2 s of silence:
+      SlidingWindow: allows 5 calls immediately (window is clear).
+      TokenBucket:   has 10 tokens saved up, allows 10 calls immediately.
+    """
+
+    def __init__(self, rate: float, capacity: int) -> None:
+        self.rate = rate            # tokens added per second
+        self.capacity = capacity    # maximum tokens (burst ceiling)
+        self._tokens: float = capacity  # start full
+        self._last_refill = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _refill(self) -> None:
+        """Add tokens based on elapsed time since last refill."""
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
+        self._last_refill = now
+
+    def allow(self) -> bool:
+        with self._lock:
+            self._refill()
+            if self._tokens >= 1:
+                self._tokens -= 1
+                return True
+            return False
+
+    @property
+    def current_tokens(self) -> float:
+        with self._lock:
+            self._refill()
+            return self._tokens
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +301,14 @@ def demo_lru_cache() -> None:
     print(f"  After get(a) and put(d): {cache}")
     assert cache.get("b") is None, "b should be evicted"
     assert cache.get("a") == 1, "a should still be present"
+
+    # EXPAND #3: TTL demo
+    print(f"\n=== LRUCache with TTL=0.1s ===")
+    ttl_cache: LRUCache[str, int] = LRUCache(capacity=5, ttl=0.1)
+    ttl_cache.put("x", 99)
+    print(f"  get('x') immediately: {ttl_cache.get('x')}")
+    time.sleep(0.15)
+    print(f"  get('x') after 0.15s (should be None): {ttl_cache.get('x')}")
     print()
 
 
@@ -235,7 +334,15 @@ def demo_rate_limiter() -> None:
         time.sleep(0.1)
     print("  (sleeping 2s to reset window...)")
     time.sleep(2.0)
-    print(f"  Call after reset: {'ALLOWED' if limiter.allow() else 'DENIED'}")
+    print(f"  Call after reset: {'ALLOWED' if limiter.allow() else 'DENIED'} (usage={limiter.current_usage})")
+
+    # EXPAND #4: Token bucket demo
+    print("\n=== TokenBucket (5 tokens/s, capacity=10) ===")
+    bucket = TokenBucket(rate=5.0, capacity=10)
+    print("  Burst: sending 12 calls immediately")
+    for i in range(12):
+        allowed = bucket.allow()
+        print(f"  Call {i+1}: {'ALLOWED' if allowed else 'DENIED '} (tokens={bucket.current_tokens:.1f})")
     print()
 
 
@@ -253,15 +360,69 @@ if __name__ == "__main__":
 #    pruning old entries.  This means it can return a value higher than
 #    max_calls after the window expires.  Fix it.
 #
+#    FIX: Extracted `_prune(now)` helper that removes timestamps outside the
+#    window.  Both `allow()` and `current_usage` call `_prune()` first.
+#    Previously `current_usage` used a generator expression that counted
+#    without removing stale entries, so after the window expired `len(self._calls)`
+#    still held the old timestamps and would return inflated counts.
+#
 # 2. EXPAND: Make LRUCache thread-safe by adding a threading.RLock.
 #    Show why an RLock (re-entrant) is needed over a plain Lock here.
+#
+#    IMPLEMENTED: Every public method acquires `self._lock = threading.RLock()`
+#    via `with self._lock`.  RLock is chosen over plain Lock because:
+#    - Plain Lock raises a deadlock if the same thread tries to acquire it twice.
+#    - If a subclass overrides `get()` and calls `super().get()` while still
+#      inside its own `with self._lock` block, a plain Lock would deadlock.
+#    - RLock tracks the owning thread and allows recursive acquisition,
+#      incrementing an internal counter.  The lock is released when the counter
+#      reaches zero (i.e., every `acquire` has a matching `release`).
 #
 # 3. EXPAND: Add a ttl (time-to-live) parameter to LRUCache so entries
 #    expire after N seconds regardless of access order.
 #
+#    IMPLEMENTED: `LRUCache.__init__` gains `ttl: Optional[float] = None`.
+#    `self._timestamps` tracks insertion time per key.  `_expired(key)` checks
+#    whether `time.monotonic() - timestamps[key] > ttl`.  `get()` calls
+#    `_expired()` before moving to end — expired entries are deleted and None
+#    is returned.  `put()` updates the timestamp on write; `get()` refreshes
+#    it on access (cache hit resets the TTL clock).
+#
 # 4. EXPAND: Implement a TokenBucket rate limiter as an alternative to
 #    SlidingWindowRateLimiter.  Compare the two under a bursty traffic pattern.
+#
+#    IMPLEMENTED: `TokenBucket(rate, capacity)`.  `_refill()` adds
+#    `elapsed * rate` tokens (capped at capacity) on every `allow()` call.
+#    Thread-safe via `threading.Lock`.
+#
+#    COMPARISON: see docstring on TokenBucket class above.  Key difference:
+#    TokenBucket accumulates credit during quiet periods, allowing larger bursts
+#    than SlidingWindow.  SlidingWindow is stricter: it only looks at the last
+#    W seconds regardless of history.  Choose SlidingWindow for hard API quota
+#    compliance; choose TokenBucket when you want to reward idle clients with
+#    burst allowance.
 #
 # 5. THINK: RingBuffer uses collections.deque(maxlen=N).  Why is deque faster
 #    than a Python list for this use-case?  What is the time complexity of
 #    list.insert(0, item) vs deque.appendleft(item)?
+#
+#    deque (double-ended queue) is implemented as a doubly-linked list of fixed-
+#    size blocks.  Appending or prepending is O(1) because it only updates two
+#    pointers at one end.
+#
+#    list is a dynamic array (contiguous block of memory).  Appending to the
+#    RIGHT end is amortised O(1) (occasional realloc doubles the buffer).
+#    But insert(0, item) — prepending — is O(n) because every existing element
+#    must be shifted one position right in memory to make room at index 0.
+#
+#    For a ring buffer that evicts the oldest element (from the left) and
+#    appends the newest (to the right):
+#    - deque.append(item):    O(1) — just update the tail pointer
+#    - deque.popleft():       O(1) — just advance the head pointer
+#    - list.append(item):     O(1) amortised — fast, same as deque
+#    - list.pop(0):           O(n) — shifts all remaining n elements left
+#
+#    With deque(maxlen=N) Python automatically discards the leftmost item when
+#    the buffer is full, giving O(1) ring-buffer semantics.  Achieving the same
+#    with a plain list requires list.pop(0) which is O(n) per insertion — 100x
+#    slower for a 100-element buffer and 1000x slower for a 1000-element buffer.
