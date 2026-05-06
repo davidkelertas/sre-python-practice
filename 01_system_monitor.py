@@ -22,13 +22,43 @@ except ImportError:
     raise SystemExit("Install psutil first:  pip install psutil")
 
 
+def _bar(pct: float, width: int = 20) -> str:
+    """ASCII progress bar: _bar(50) -> '##########----------'"""
+    filled = round(pct / 100 * width)
+    return "#" * filled + "-" * (width - filled)
+
+
+def _spin_worker(duration_s: float) -> None:
+    """Burn one core for duration_s seconds. Must be a top-level function so
+    multiprocessing can pickle it on all platforms."""
+    end = time.monotonic() + duration_s
+    while time.monotonic() < end:
+        _ = 99999 ** 7
+
+
+def burn_cpu(duration_s: float = 0.8) -> None:
+    """Saturate every logical core using multiprocessing.
+    threading cannot do this — the GIL only lets one thread run Python at a time.
+    Each Process gets its own interpreter and its own GIL."""
+    import multiprocessing
+    procs = [
+        multiprocessing.Process(target=_spin_worker, args=(duration_s,))
+        for _ in range(psutil.cpu_count(logical=True))
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
+
+
 # --- Data model for a single snapshot of system state ---
 @dataclass
 class Snapshot:
     timestamp: datetime
-    cpu_pct: float
+    cpu_pct: float          # average across all cores
     mem_pct: float
     disk_pct: float
+    core_pcts: List[float] = field(default_factory=list)
     # field(default_factory=...) avoids the mutable-default-argument trap
     alerts: List[str] = field(default_factory=list)
 
@@ -44,6 +74,13 @@ class Snapshot:
             f"MEM {self.mem_pct:5.1f}% | "
             f"DISK {self.disk_pct:5.1f}%"
             + (f"  !! {', '.join(self.alerts)}" if self.alerts else "")
+        )
+
+    def core_summary(self) -> str:
+        """Per-core bar graph lines, e.g.: Core 0: ##########---------- 52.0%"""
+        return "\n".join(
+            f"  Core {i}: {_bar(pct)} {pct:5.1f}%"
+            for i, pct in enumerate(self.core_pcts)
         )
 
 
@@ -66,9 +103,9 @@ class SystemMonitor:
     def collect(self) -> Snapshot:
         # psutil.cpu_percent(interval=None) returns usage since last call;
         # the first call returns 0.0 - use interval=1 for a blocking reading.
-        # interval=1 makes psutil block and measure over 1 real second (accurate)
-        # without interval it returns 0.0 on the very first call — see average_cpu fix below
-        cpu = psutil.cpu_percent(interval=1)
+        # percpu=True returns one float per core; average that for threshold checks
+        core_pcts = psutil.cpu_percent(percpu=True, interval=1)
+        cpu = sum(core_pcts) / len(core_pcts)
         mem = psutil.virtual_memory().percent
         disk = psutil.disk_usage(self.disk_path).percent
 
@@ -85,6 +122,7 @@ class SystemMonitor:
             cpu_pct=cpu,
             mem_pct=mem,
             disk_pct=disk,
+            core_pcts=core_pcts,
             alerts=alerts,
         )
         self._history.append(snap)
@@ -124,8 +162,14 @@ def main() -> None:
     iteration = 0
     try:
         while True:
+            if iteration % 2 == 1:   # odd iterations: spike all cores before sampling
+                print("  [load] burning CPU...")
+                burn_cpu(duration_s=0.8)
+
             snap = monitor.collect()
-            print(snap.summary())
+            label = " *LOAD*" if iteration % 2 == 1 else ""
+            print(snap.summary() + label)
+            print(snap.core_summary())
             iteration += 1
             if args.count and iteration >= args.count:
                 break
