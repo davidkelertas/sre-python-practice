@@ -14,7 +14,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 try:
     import requests
@@ -52,36 +52,51 @@ class CheckResult:
         return f"{label} {self.status_code}  {self.latency_ms:6.0f}ms  {self.url}"
 
 
-def check_url(url: str, timeout: float = 5.0) -> CheckResult:
-    """Single blocking HTTP GET.  Returns a CheckResult regardless of outcome."""
-    start = time.monotonic()
-    try:
-        # stream=False is default; we just want headers and status quickly
-        resp = requests.get(url, timeout=timeout, allow_redirects=True)
-        latency = (time.monotonic() - start) * 1000
-        return CheckResult(url=url, status_code=resp.status_code, latency_ms=latency)
-    except requests.exceptions.ConnectionError as e:
-        return CheckResult(url=url, error=f"ConnectionError: {e}")
-    except requests.exceptions.Timeout:
-        return CheckResult(url=url, error=f"Timeout after {timeout}s")
-    except requests.exceptions.RequestException as e:
-        return CheckResult(url=url, error=str(e))
+def check_url(url: str, timeout: float = 5.0, retries: int = 0) -> CheckResult:
+    """Single blocking HTTP GET with optional retries and exponential back-off.
+    Returns a CheckResult regardless of outcome."""
+    # EXPAND #2: retry loop with exponential back-off (0.5s, 1s, 2s, ...)
+    backoff = 0.5
+    last_result: Optional[CheckResult] = None
+    for attempt in range(retries + 1):
+        if attempt > 0:
+            time.sleep(backoff)
+            backoff *= 2
+        start = time.monotonic()
+        try:
+            resp = requests.get(url, timeout=timeout, allow_redirects=True)
+            latency = (time.monotonic() - start) * 1000
+            result = CheckResult(url=url, status_code=resp.status_code, latency_ms=latency)
+        except requests.exceptions.ConnectionError as e:
+            result = CheckResult(url=url, error=f"ConnectionError: {e}")
+        except requests.exceptions.Timeout:
+            result = CheckResult(url=url, error=f"Timeout after {timeout}s")
+        except requests.exceptions.RequestException as e:
+            result = CheckResult(url=url, error=str(e))
+        last_result = result
+        if result.healthy:
+            return result
+    return last_result  # type: ignore[return-value]
 
 
-def worker(url_queue: queue.Queue, result_queue: queue.Queue, timeout: float) -> None:
+def worker(url_queue: queue.Queue, result_queue: queue.Queue, timeout: float, retries: int) -> None:
     """Thread target: pull URLs from url_queue, push results to result_queue."""
     while True:
         try:
-            # block=False raises queue.Empty immediately if nothing is left
             url = url_queue.get(block=False)
         except queue.Empty:
             return
-        result = check_url(url, timeout=timeout)
+        result = check_url(url, timeout=timeout, retries=retries)
         result_queue.put(result)
         url_queue.task_done()
 
 
-def run_checks(urls: List[str], workers: int = 4, timeout: float = 5.0) -> List[CheckResult]:
+def run_checks(
+    urls: List[str],
+    workers: int = 4,
+    timeout: float = 5.0,
+    retries: int = 0,
+) -> List[CheckResult]:
     """Fan-out URL checks across a thread pool, collect and return results."""
     url_queue: queue.Queue = queue.Queue()
     result_queue: queue.Queue = queue.Queue()
@@ -90,13 +105,15 @@ def run_checks(urls: List[str], workers: int = 4, timeout: float = 5.0) -> List[
         url_queue.put(url)
 
     threads = []
-    # min() so we don't spin up 10 threads for 2 URLs
     for _ in range(min(workers, len(urls))):
-        t = threading.Thread(target=worker, args=(url_queue, result_queue, timeout), daemon=True)
+        t = threading.Thread(
+            target=worker,
+            args=(url_queue, result_queue, timeout, retries),
+            daemon=True,
+        )
         t.start()
         threads.append(t)
 
-    # Wait for all threads to finish
     for t in threads:
         t.join()
 
@@ -104,7 +121,6 @@ def run_checks(urls: List[str], workers: int = 4, timeout: float = 5.0) -> List[
     while not result_queue.empty():
         results.append(result_queue.get())
 
-    # Sort so healthy URLs appear first, then by URL name
     results.sort(key=lambda r: (not r.healthy, r.url))
     return results
 
@@ -121,10 +137,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--workers", type=int, default=4, help="Parallel check threads")
     p.add_argument("--timeout", type=float, default=5.0, help="Per-request timeout (s)")
     p.add_argument("--watch", type=float, default=0, help="Re-run every N seconds (0=once)")
+    # EXPAND #2: --retries flag
+    p.add_argument("--retries", type=int, default=0, help="Retry count per URL on failure (exponential back-off)")
+    # EXPAND #3: --alert-threshold flag
+    p.add_argument(
+        "--alert-threshold",
+        type=int,
+        default=3,
+        help="Print ALERT after this many consecutive failures per URL (default: 3)",
+    )
     return p.parse_args()
 
 
-def print_report(results: List[CheckResult]) -> None:
+def print_report(
+    results: List[CheckResult],
+    consecutive_failures: Dict[str, int],
+    alert_threshold: int,
+) -> None:
     healthy = sum(1 for r in results if r.healthy)
     total = len(results)
     print(f"\n{'='*60}")
@@ -132,6 +161,10 @@ def print_report(results: List[CheckResult]) -> None:
     print(f"{'='*60}")
     for r in results:
         print(r)
+        # EXPAND #3: ALERT after N consecutive failures
+        if not r.healthy:
+            if consecutive_failures.get(r.url, 0) >= alert_threshold:
+                print(f"  *** ALERT: {r.url} has failed {consecutive_failures[r.url]} times in a row ***")
     if healthy < total:
         print(f"\n  *** {total - healthy} endpoint(s) UNHEALTHY ***")
 
@@ -139,16 +172,36 @@ def print_report(results: List[CheckResult]) -> None:
 def main() -> None:
     args = parse_args()
 
-    if args.urls_file:
-        urls = load_urls_from_file(args.urls_file)
-    else:
-        urls = DEFAULT_URLS
-        print(f"No --urls-file given; using {len(urls)} built-in test URLs\n")
+    # EXPAND #3: track consecutive failures across watch iterations
+    consecutive_failures: Dict[str, int] = {}
 
     try:
         while True:
-            results = run_checks(urls, workers=args.workers, timeout=args.timeout)
-            print_report(results)
+            # BUG FIX #1: re-read the URLs file on every iteration so new URLs
+            # added between watch cycles are picked up automatically.
+            if args.urls_file:
+                urls = load_urls_from_file(args.urls_file)
+            else:
+                urls = DEFAULT_URLS
+                if not args.watch:
+                    print(f"No --urls-file given; using {len(urls)} built-in test URLs\n")
+
+            results = run_checks(
+                urls,
+                workers=args.workers,
+                timeout=args.timeout,
+                retries=args.retries,
+            )
+
+            # Update consecutive failure counts
+            for r in results:
+                if r.healthy:
+                    consecutive_failures[r.url] = 0
+                else:
+                    consecutive_failures[r.url] = consecutive_failures.get(r.url, 0) + 1
+
+            print_report(results, consecutive_failures, args.alert_threshold)
+
             if not args.watch:
                 break
             time.sleep(args.watch)
@@ -167,14 +220,68 @@ if __name__ == "__main__":
 #    the new URL will never be checked.  Modify load_urls_from_file so it re-reads
 #    the file on every iteration in watch mode.
 #
+#    FIX: Moved the `load_urls_from_file` call (and the DEFAULT_URLS fallback)
+#    inside the while-True loop so that every iteration re-evaluates the URL list.
+#    Previously the list was loaded once before the loop, so any edits made to the
+#    file while --watch was running were never picked up.
+#
 # 2. EXPAND: Add a --retries N flag so a failed URL is retried up to N times
 #    before being recorded as unhealthy.  Use exponential back-off (0.5s, 1s, 2s).
+#
+#    IMPLEMENTED: check_url now accepts a `retries` parameter and loops up to
+#    retries+1 times.  Between attempts it sleeps `backoff` seconds and doubles
+#    it each time (0.5, 1.0, 2.0, …).  The --retries CLI flag threads the value
+#    through run_checks → worker → check_url.
 #
 # 3. EXPAND: Track consecutive failures per URL and only print "ALERT" once it
 #    has failed more than a threshold (e.g., 3 times in a row).
 #
+#    IMPLEMENTED: `consecutive_failures` dict is maintained in main().  After
+#    each run_checks call it increments the counter for unhealthy URLs and resets
+#    it to 0 when they recover.  print_report emits an ALERT line when the
+#    counter reaches --alert-threshold (default 3).
+#
 # 4. EXPAND: Replace threading with asyncio + aiohttp (see 07_async_health.py)
 #    and compare performance against this version for 50 URLs.
 #
+#    THREADING vs ASYNCIO COMPARISON:
+#    For a small number of URLs (e.g., 6) the wall-clock time is similar: both
+#    are bounded by the slowest network round-trip, and thread-creation overhead
+#    is negligible.
+#
+#    For 50 URLs all pointing at httpbin.org/delay/1 (1-second latency each):
+#    - Threading version: total time ≈ ceil(50 / workers) × 1s.
+#      With --workers 4 that is ~13 s.  With --workers 50 it matches async.
+#    - Asyncio version: all 50 coroutines are in-flight simultaneously (up to
+#      --concurrency limit), so total time ≈ 1s regardless of URL count,
+#      as long as concurrency >= 50.
+#
+#    The key difference is resource cost at scale.  Each OS thread consumes
+#    ~8 MB of stack; 1000 threads = ~8 GB RAM.  Each asyncio coroutine costs
+#    only a few KB.  For high-fan-out monitoring (thousands of endpoints) asyncio
+#    wins decisively.  For CPU-bound work (not the case here) threads or
+#    multiprocessing are preferred because asyncio is single-threaded.
+#
 # 5. THINK: This script uses daemon=True threads.  What does daemon mean here
 #    and what happens to in-flight requests if the main thread exits?
+#
+#    ANSWER: A daemon thread is one that does NOT block the Python interpreter
+#    from exiting.  When ALL non-daemon threads (including the main thread)
+#    finish, the interpreter shuts down immediately — daemon threads are killed
+#    at that point without any cleanup, even if they are mid-execution.
+#
+#    In this script, the worker threads are daemon=True.  This means:
+#    - If the user presses Ctrl-C (KeyboardInterrupt) the main() function
+#      catches it, prints "Stopped." and returns.  The main thread ends.
+#    - The interpreter then tears down without waiting for workers.
+#    - Any in-flight HTTP requests being made by those worker threads are
+#      abruptly terminated: TCP connections may be left half-open, response
+#      bodies may never be read, and the remote server gets a connection reset.
+#    - Results that were already computed but not yet placed in result_queue
+#      are silently dropped.
+#
+#    The trade-off is intentional here: we want the script to exit promptly
+#    on Ctrl-C rather than waiting up to `timeout` seconds for every in-flight
+#    request to complete.  For scripts where correctness matters more than
+#    speed (e.g., writing audit logs), you would use non-daemon threads and
+#    call t.join() with a short timeout before raising SystemExit.
