@@ -10,9 +10,11 @@ Run with custom interval: python 01_system_monitor.py --interval 2 --count 5
 
 import argparse
 import csv
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import IO, List, Optional
 
@@ -160,6 +162,55 @@ class SystemMonitor:
         return sum(1 for s in self._history if not s.is_healthy())
 
 
+# ---------------------------------------------------------------------------
+# Exercise 5: Prometheus-format /metrics HTTP endpoint
+# ---------------------------------------------------------------------------
+# A shared reference to the latest snapshot — the HTTP handler reads it.
+# Using a list as a mutable container so the handler closure can see updates.
+_latest_snap: List = [None]
+
+
+class MetricsHandler(BaseHTTPRequestHandler):
+    """Serve the latest snapshot as Prometheus text-format on GET /metrics."""
+
+    def do_GET(self) -> None:
+        if self.path != "/metrics":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        snap: Optional[Snapshot] = _latest_snap[0]
+        if snap is None:
+            body = b"# no data yet\n"
+        else:
+            lines = [
+                f'sre_cpu_percent{{}} {snap.cpu_pct:.1f}',
+                f'sre_mem_percent{{}} {snap.mem_pct:.1f}',
+                f'sre_disk_percent{{}} {snap.disk_pct:.1f}',
+                f'sre_net_tx_kb{{}} {snap.net_tx_kb:.1f}',
+                f'sre_net_rx_kb{{}} {snap.net_rx_kb:.1f}',
+            ]
+            for i, pct in enumerate(snap.core_pcts):
+                lines.append(f'sre_core_percent{{core="{i}"}} {pct:.1f}')
+            body = "\n".join(lines).encode() + b"\n"
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_) -> None:
+        pass   # suppress default access log spam to stdout
+
+
+def start_metrics_server(port: int = 8000) -> None:
+    """Start the HTTP server in a daemon thread so it exits with the main process."""
+    server = HTTPServer(("", port), MetricsHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    print(f"Prometheus metrics at http://localhost:{port}/metrics\n")
+
+
 CSV_FIELDS = ["timestamp", "cpu_pct", "mem_pct", "disk_pct", "net_tx_kb", "net_rx_kb", "alerts"]
 
 
@@ -193,6 +244,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mem-warn", type=float, default=85.0)
     p.add_argument("--disk-warn", type=float, default=90.0)
     p.add_argument("--csv", type=Path, metavar="FILE", help="Append snapshots to a CSV file")
+    p.add_argument("--metrics-port", type=int, default=0,
+                   help="Expose Prometheus /metrics on this port (0=disabled)")
     return p.parse_args()
 
 
@@ -203,6 +256,9 @@ def main() -> None:
         mem_threshold=args.mem_warn,
         disk_threshold=args.disk_warn,
     )
+
+    if args.metrics_port:
+        start_metrics_server(args.metrics_port)
 
     csv_file, csv_writer = (None, None)
     if args.csv:
@@ -218,6 +274,7 @@ def main() -> None:
                 burn_cpu(duration_s=0.8)
 
             snap = monitor.collect()
+            _latest_snap[0] = snap   # update shared state for the metrics HTTP handler
             label = " *LOAD*" if iteration % 2 == 1 else ""
             print(snap.summary() + label)
             print(snap.core_summary())
