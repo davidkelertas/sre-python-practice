@@ -9,10 +9,12 @@ Run with custom interval: python 01_system_monitor.py --interval 2 --count 5
 """
 
 import argparse
+import csv
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List
+from pathlib import Path
+from typing import IO, List, Optional
 
 
 # --- Try importing psutil; fall back with a clear message ---
@@ -158,6 +160,31 @@ class SystemMonitor:
         return sum(1 for s in self._history if not s.is_healthy())
 
 
+CSV_FIELDS = ["timestamp", "cpu_pct", "mem_pct", "disk_pct", "net_tx_kb", "net_rx_kb", "alerts"]
+
+
+def open_csv(path: Path) -> tuple:
+    """Open a CSV file for appending, write header if new. Returns (file, writer)."""
+    is_new = not path.exists()
+    f: IO = path.open("a", newline="")
+    writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+    if is_new:
+        writer.writeheader()
+    return f, writer
+
+
+def snap_to_row(snap: Snapshot) -> dict:
+    return {
+        "timestamp": snap.timestamp.isoformat(timespec="seconds"),
+        "cpu_pct": f"{snap.cpu_pct:.1f}",
+        "mem_pct": f"{snap.mem_pct:.1f}",
+        "disk_pct": f"{snap.disk_pct:.1f}",
+        "net_tx_kb": f"{snap.net_tx_kb:.1f}",
+        "net_rx_kb": f"{snap.net_rx_kb:.1f}",
+        "alerts": ";".join(snap.alerts),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="System resource monitor")
     p.add_argument("--interval", type=float, default=5.0, help="Seconds between polls")
@@ -165,6 +192,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cpu-warn", type=float, default=80.0)
     p.add_argument("--mem-warn", type=float, default=85.0)
     p.add_argument("--disk-warn", type=float, default=90.0)
+    p.add_argument("--csv", type=Path, metavar="FILE", help="Append snapshots to a CSV file")
     return p.parse_args()
 
 
@@ -175,6 +203,11 @@ def main() -> None:
         mem_threshold=args.mem_warn,
         disk_threshold=args.disk_warn,
     )
+
+    csv_file, csv_writer = (None, None)
+    if args.csv:
+        csv_file, csv_writer = open_csv(args.csv)
+        print(f"Logging to {args.csv}\n")
 
     print(f"Monitoring system every {args.interval}s  (Ctrl-C to stop)\n")
     iteration = 0
@@ -188,12 +221,20 @@ def main() -> None:
             label = " *LOAD*" if iteration % 2 == 1 else ""
             print(snap.summary() + label)
             print(snap.core_summary())
+
+            if csv_writer:
+                csv_writer.writerow(snap_to_row(snap))
+                csv_file.flush()   # flush each row so the file is readable while running
+
             iteration += 1
             if args.count and iteration >= args.count:
                 break
             time.sleep(max(0, args.interval - 1))  # cpu_percent already slept 1s
     except KeyboardInterrupt:
         pass
+    finally:
+        if csv_file:
+            csv_file.close()
 
     print(f"\n--- Summary ---")
     print(f"Samples     : {len(monitor._history)}")
