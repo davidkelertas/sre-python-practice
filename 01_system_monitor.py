@@ -59,6 +59,8 @@ class Snapshot:
     mem_pct: float
     disk_pct: float
     core_pcts: List[float] = field(default_factory=list)
+    net_tx_kb: float = 0.0   # KB/s sent this interval
+    net_rx_kb: float = 0.0   # KB/s received this interval
     # field(default_factory=...) avoids the mutable-default-argument trap
     alerts: List[str] = field(default_factory=list)
 
@@ -72,7 +74,9 @@ class Snapshot:
             f"[{ts}] {status:5s} | "
             f"CPU {self.cpu_pct:5.1f}% | "
             f"MEM {self.mem_pct:5.1f}% | "
-            f"DISK {self.disk_pct:5.1f}%"
+            f"DISK {self.disk_pct:5.1f}% | "
+            f"TX {self.net_tx_kb:7.1f} KB/s | "
+            f"RX {self.net_rx_kb:7.1f} KB/s"
             + (f"  !! {', '.join(self.alerts)}" if self.alerts else "")
         )
 
@@ -99,6 +103,9 @@ class SystemMonitor:
         self.disk_threshold = disk_threshold
         self.disk_path = disk_path
         self._history: List[Snapshot] = []
+        # Seed with current counters so the first delta is meaningful
+        self._prev_net = psutil.net_io_counters()
+        self._prev_net_time = time.monotonic()
 
     def collect(self) -> Snapshot:
         # psutil.cpu_percent(interval=None) returns usage since last call;
@@ -108,6 +115,15 @@ class SystemMonitor:
         cpu = sum(core_pcts) / len(core_pcts)
         mem = psutil.virtual_memory().percent
         disk = psutil.disk_usage(self.disk_path).percent
+
+        # Network delta: subtract previous cumulative counters to get per-interval rate
+        now_net = psutil.net_io_counters()
+        now_time = time.monotonic()
+        elapsed = now_time - self._prev_net_time or 1.0   # guard against zero
+        tx_kb = (now_net.bytes_sent - self._prev_net.bytes_sent) / 1024 / elapsed
+        rx_kb = (now_net.bytes_recv - self._prev_net.bytes_recv) / 1024 / elapsed
+        self._prev_net = now_net
+        self._prev_net_time = now_time
 
         alerts = []
         if cpu > self.cpu_threshold:
@@ -123,6 +139,8 @@ class SystemMonitor:
             mem_pct=mem,
             disk_pct=disk,
             core_pcts=core_pcts,
+            net_tx_kb=max(0.0, tx_kb),
+            net_rx_kb=max(0.0, rx_kb),
             alerts=alerts,
         )
         self._history.append(snap)
