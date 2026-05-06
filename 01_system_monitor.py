@@ -66,8 +66,9 @@ class SystemMonitor:
     def collect(self) -> Snapshot:
         # psutil.cpu_percent(interval=None) returns usage since last call;
         # the first call returns 0.0 - use interval=1 for a blocking reading.
+        # interval=1 makes psutil block and measure over 1 real second (accurate)
+        # without interval it returns 0.0 on the very first call — see average_cpu fix below
         cpu = psutil.cpu_percent(interval=1)
-        # breakpoint()          # execution stops HERE, drops you into pdb
         mem = psutil.virtual_memory().percent
         disk = psutil.disk_usage(self.disk_path).percent
 
@@ -161,3 +162,17 @@ if __name__ == "__main__":
 # 5. THINK: In production you'd push metrics to Prometheus via
 #    prometheus_client. How would you add a /metrics HTTP endpoint here
 #    without blocking the poll loop?  (Hint: threading.Thread)
+#
+# python -m pdb 01_system_monitor.py
+# n         next line
+# s         step into
+# c         continue
+# r         return from function
+# q         quit
+# l         list source
+# w         call stack
+# u / d     up/down the stack
+# b 42      set breakpoint at line 42
+# cl 1      clear breakpoint 1
+# p expr    print expression
+# pp expr   pretty-print
