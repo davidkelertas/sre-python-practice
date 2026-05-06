@@ -10,8 +10,10 @@ Run (demo):        python 06_file_watcher.py --demo
 """
 
 import argparse
+import collections
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -83,14 +85,35 @@ class LogTailer:
     """
     Reads a file from the end and streams new lines to a queue.
     Handles log rotation by detecting when the file shrinks (inode swap).
+
+    Exercise 3: max_queue_size caps the internal deque. When the deque is full,
+    the oldest item is dropped (popleft) before inserting the new line so the
+    producer never blocks. A warning is printed to stderr on each drop.
     """
 
-    def __init__(self, path: Path, line_queue: queue.Queue, poll_interval: float = 0.5) -> None:
+    # EXERCISE 3: Added max_queue_size parameter.
+    # When the queue is full we drop the oldest item (popleft from a deque) and
+    # log a warning rather than blocking. This keeps the tailer thread alive and
+    # responsive even if the consumer falls far behind — useful in SRE tooling
+    # where losing a few log lines is preferable to blocking the producer or
+    # letting memory grow without bound.
+    def __init__(
+        self,
+        path: Path,
+        line_queue: queue.Queue,
+        poll_interval: float = 0.5,
+        max_queue_size: Optional[int] = None,
+    ) -> None:
         self.path = path
         self.queue = line_queue
         self.poll_interval = poll_interval
+        self.max_queue_size = max_queue_size
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True, name="tailer")
+        # Internal deque used only when max_queue_size is set.
+        self._deque: Optional[collections.deque] = (
+            collections.deque(maxlen=None) if max_queue_size is not None else None
+        )
 
     def start(self) -> "LogTailer":
         self._thread.start()
@@ -98,6 +121,24 @@ class LogTailer:
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    def _enqueue(self, line: str) -> None:
+        """Put a line into the queue, honouring max_queue_size."""
+        if self.max_queue_size is None:
+            self.queue.put(line)
+            return
+
+        # Non-blocking bounded enqueue: drop oldest if full.
+        assert self._deque is not None
+        self._deque.append(line)
+        if len(self._deque) > self.max_queue_size:
+            dropped = self._deque.popleft()
+            print(
+                f"[tailer] WARNING: queue full (max={self.max_queue_size}), "
+                f"dropped oldest line: {dropped!r}",
+                file=sys.stderr,
+            )
+        self.queue.put(line)
 
     def _run(self) -> None:
         # Seek to end so we only get NEW lines (tail -f behaviour)
@@ -109,15 +150,30 @@ class LogTailer:
             return
 
         current_inode = os.stat(self.path).st_ino
+        # EXERCISE 1 (BUG FIX): track the last known file size so we can detect
+        # same-inode rotation (file deleted+recreated on filesystems that recycle
+        # inodes quickly, or truncated in-place).
+        current_size = os.stat(self.path).st_size
 
         while not self._stop_event.is_set():
             # Detect log rotation: inode changed = file was replaced
             try:
-                new_inode = os.stat(self.path).st_ino
-                if new_inode != current_inode:
+                stat = os.stat(self.path)
+                new_inode = stat.st_ino
+                new_size = stat.st_size
+
+                # EXERCISE 1 (BUG FIX): also reopen when the file has shrunk
+                # even if the inode is the same. This catches the case where the
+                # log daemon deletes and recreates the file on a filesystem that
+                # immediately recycles the same inode number (e.g. small tmpfs
+                # partitions or certain ext4 configurations). Without the size
+                # check we would silently miss all new lines written after the
+                # recreation because our read position would be past EOF.
+                if new_inode != current_inode or new_size < current_size:
                     f.close()
                     f = self.path.open()
                     current_inode = new_inode
+                    current_size = 0  # reset; will be updated below
                     print("[tailer] log rotation detected, reopening file")
             except FileNotFoundError:
                 time.sleep(self.poll_interval)
@@ -125,7 +181,8 @@ class LogTailer:
 
             line = f.readline()
             if line:
-                self.queue.put(line.rstrip("\n"))
+                current_size = os.fstat(f.fileno()).st_size
+                self._enqueue(line.rstrip("\n"))
             else:
                 time.sleep(self.poll_interval)
 
@@ -208,14 +265,21 @@ def watch_mode(path: Path) -> None:
             print("\nStopped.")
 
 
-def tail_mode(path: Path) -> None:
-    print(f"Tailing {path} (Ctrl-C to stop)...")
+# EXERCISE 2: Added optional filter_pattern parameter.
+# tail_mode now accepts a compiled regex; only lines that match are printed,
+# mirroring `tail -f app.log | grep PATTERN` but without the extra process.
+def tail_mode(path: Path, filter_pattern: Optional[re.Pattern] = None) -> None:
+    desc = f" (filter: {filter_pattern.pattern})" if filter_pattern else ""
+    print(f"Tailing {path}{desc} (Ctrl-C to stop)...")
     q: queue.Queue = queue.Queue()
     tailer = LogTailer(path, q).start()
     try:
         while True:
             try:
-                print(q.get(timeout=1))
+                line = q.get(timeout=1)
+                # Apply filter: skip lines that do not match the pattern.
+                if filter_pattern is None or filter_pattern.search(line):
+                    print(line)
             except queue.Empty:
                 pass
     except KeyboardInterrupt:
@@ -229,6 +293,12 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--watch", type=Path, metavar="FILE", help="Watch a file for changes")
     g.add_argument("--tail", type=Path, metavar="FILE", help="Tail a growing log file")
     g.add_argument("--demo", action="store_true", help="Run built-in demo")
+    # EXERCISE 2: --filter wires a regex pattern through to tail_mode.
+    p.add_argument(
+        "--filter",
+        metavar="PATTERN",
+        help="Only print lines matching this regex (--tail mode only)",
+    )
     return p.parse_args()
 
 
@@ -237,7 +307,15 @@ def main() -> None:
     if args.watch:
         watch_mode(args.watch)
     elif args.tail:
-        tail_mode(args.tail)
+        # EXERCISE 2: compile the pattern once and pass it down.
+        pattern: Optional[re.Pattern] = None
+        if args.filter:
+            try:
+                pattern = re.compile(args.filter)
+            except re.error as exc:
+                print(f"Invalid --filter pattern: {exc}", file=sys.stderr)
+                sys.exit(1)
+        tail_mode(args.tail, filter_pattern=pattern)
     else:
         demo()
 
@@ -247,20 +325,86 @@ if __name__ == "__main__":
 
 
 # =============================================================================
-# EXERCISES
+# EXERCISES — ANSWERS
 # =============================================================================
-# 1. BUG: LogTailer._run uses os.stat to detect rotation but doesn't handle
-#    the case where the file is deleted and recreated with the same inode
-#    (common on some filesystems).  What additional check would make this robust?
+# 1. BUG FIX (LogTailer._run — same-inode rotation)
+#    ---------------------------------------------------------------------------
+#    The original code only checked whether os.stat().st_ino changed. On some
+#    filesystems (small tmpfs, certain ext4 configurations) the OS recycles inode
+#    numbers immediately, so deleting a file and creating a new one can yield the
+#    same inode. The tailer would then keep reading from the stale file descriptor,
+#    silently missing all new content.
 #
-# 2. EXPAND: Add a --filter PATTERN flag to tail_mode that only prints lines
-#    matching a regex pattern (like `tail -f app.log | grep ERROR`).
+#    Fix: also track the current file size. If the new size is *less* than the
+#    previously observed size (i.e. the file shrank), treat it as rotation even
+#    when the inode matches. See _run() above where `new_size < current_size` is
+#    ORed with the inode comparison.
 #
-# 3. EXPAND: Add a max_queue_size to LogTailer so if the consumer is slow
-#    the queue doesn't grow unbounded.  What should happen when it's full?
+# 2. EXPAND (--filter PATTERN in tail_mode)
+#    ---------------------------------------------------------------------------
+#    parse_args() now exposes a --filter PATTERN argument. main() compiles the
+#    pattern with re.compile() (with a helpful error message on bad patterns) and
+#    passes the compiled object to tail_mode(). Inside tail_mode() each dequeued
+#    line is tested with pattern.search(); lines that do not match are silently
+#    skipped. Using .search() (not .match()) allows the pattern to appear anywhere
+#    on the line, matching the intuitive behaviour of `grep`.
 #
-# 4. EXPAND: On Linux, replace the mtime polling in FileWatcher with inotify
-#    via the `watchdog` library for immediate detection instead of polling.
+# 3. EXPAND (max_queue_size in LogTailer)
+#    ---------------------------------------------------------------------------
+#    LogTailer.__init__ now accepts an optional max_queue_size: int. Internally
+#    _enqueue() maintains a collections.deque that mirrors items going into the
+#    queue. When len(deque) > max_queue_size the *oldest* item is removed with
+#    popleft() and a warning is printed to stderr. The producer never calls
+#    queue.put() with block=True, so the background tailer thread is never stalled
+#    by a slow consumer. The tradeoff is that under sustained backpressure older
+#    log lines are silently dropped — acceptable for real-time monitoring tools
+#    where recency matters more than completeness.
 #
-# 5. THINK: FileWatcher uses daemon=True.  What are the implications for data
-#    integrity if the main thread exits while the callback is mid-execution?
+# 4. EXPAND (watchdog / inotify vs. mtime polling)
+#    ---------------------------------------------------------------------------
+#    On Linux the `watchdog` library wraps inotify (via the InotifyObserver back-
+#    end), which gives *instant* notification the moment the kernel writes the
+#    change — no polling delay at all.  Our FileWatcher polls every `interval`
+#    seconds, so a change made 1 ms after a poll won't be noticed for up to
+#    `interval - 1 ms` longer.
+#
+#    Why we don't add watchdog as a dependency here:
+#      • watchdog is a third-party package (pip install watchdog) and pulls in
+#        native extension code.  Adding it would break the "zero-dependency"
+#        guarantee of this practice module, which must run with the stdlib alone.
+#      • inotify is Linux-only; watchdog falls back to polling on macOS/Windows
+#        anyway (unless FSEventsObserver / ReadDirectoryChangesW are used), so
+#        the cross-platform story becomes more complex.
+#      • For most SRE use-cases a 0.5–1 s polling interval is acceptable and is
+#        simpler to reason about and test.
+#
+#    The right choice in production: use watchdog (or inotify bindings directly)
+#    for latency-sensitive workloads on Linux; use mtime polling for simplicity
+#    and cross-platform compatibility when sub-second latency isn't required.
+#
+# 5. THINK (daemon=True and data integrity)
+#    ---------------------------------------------------------------------------
+#    Setting daemon=True on the FileWatcher / LogTailer thread means the Python
+#    interpreter will *not* wait for those threads to finish when the main thread
+#    exits. The OS abruptly terminates them.
+#
+#    Data integrity risk: if the callback is in the middle of writing to a file,
+#    database, or network socket when the main thread calls sys.exit() (or simply
+#    returns), the write is cut short. The result can be:
+#      • a truncated or partially-written log entry
+#      • a half-committed database transaction that leaves the DB in an
+#        inconsistent state
+#      • a buffered network write that is never flushed
+#
+#    Mitigation strategies:
+#      a) Use threading.Event + thread.join() for a graceful shutdown (as done in
+#         FileWatcher.stop()), giving the callback time to finish.
+#      b) Wrap critical writes in try/finally to flush/close resources even when
+#         interrupted.
+#      c) Use atomics (write to a temp file then os.rename()) so partial writes
+#         are never visible to readers.
+#
+#    daemon=True is therefore appropriate only for truly fire-and-forget background
+#    tasks (e.g. a health-check pinger) where losing in-flight work on exit is
+#    acceptable, or when you pair it with a proper shutdown sequence that joins
+#    the thread before the main thread exits.
